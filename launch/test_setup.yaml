@@ -10,7 +10,7 @@ confidence_gain: 0.01
 sample_rate: 10
 
 # localization update rate [1/s]
-loc_update_rate: 10
+loc_update_rate: 15
 
 # map tile update rate [1/s]
 map_update_rate: 0.5
@@ -43,10 +43,10 @@ min_sample_std_xy: 0.025
 min_sample_std_yaw: 0.025
 
 # initial/maximum particle spread in x and y [m]
-max_sample_std_xy: 0.5
+max_sample_std_xy: 0.25
 
 # initial/maximum particle spread in yaw angle [rad]
-max_sample_std_yaw: 0.5
+max_sample_std_yaw: 0.25
 
 # threshold for 1D / 2D position decision making (minimum average second order gradient)
 #   if worst gradient direction is below this value we go into 1D mode
@@ -62,10 +62,10 @@ constrain_threshold_yaw: 0.2
 min_points: 20
 
 # solver update gain, lower gain = more stability / slower convergence
-solver_gain: 0.1
+solver_gain: 0.05
 
 # solver update damping, higher damping = more stability / slower convergence
-solver_damping: 1000
+solver_damping: 500
 
 # number of gauss-newton iterations per sample per scan
 solver_iterations: 20

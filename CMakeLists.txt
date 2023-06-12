@@ -19,6 +19,7 @@ find_package(catkin REQUIRED
 			sensor_msgs
 			geometry_msgs
             neo_common
+            movexbot_msgs
         )
 
 include_directories(
@@ -35,6 +36,7 @@ catkin_package(
 		sensor_msgs
 		geometry_msgs
 		neo_common
+        movexbot_msgs
 )
 
 add_executable(neo_localization_node src/neo_localization_node.cpp)
@@ -45,6 +47,11 @@ install(TARGETS neo_localization_node
        ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
        LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
        RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
+install(
+  DIRECTORY launch
+  DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
 )
 
 install(DIRECTORY include/${PROJECT_NAME}/

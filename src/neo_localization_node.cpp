@@ -11,6 +11,7 @@
 #include <neo_localization/GridMap.h>
 
 #include <ros/ros.h>
+#include <ros/topic.h>
 #include <angles/angles.h>
 #include <nav_msgs/Odometry.h>
 #include <nav_msgs/OccupancyGrid.h>
@@ -28,7 +29,7 @@
 #include <cmath>
 #include <array>
 
-
+#include <movexbot_msgs/SetSlamCmd.h>
 /*
  * Coordinate systems:
  * - Sensor in [meters, rad], aka. "laserX"
@@ -43,7 +44,7 @@
  */
 class NeoLocalizationNode {
 public:
-	NeoLocalizationNode()
+	NeoLocalizationNode():localization_state(LOCALIZATION_STATE_OFF)/* ,base_to_odom(tf::Transform::getIdentity(), ros::Time(0), "odom", "odom_link") */
 	{
 		m_node_handle.param("broadcast_tf", m_broadcast_tf, true);
 		m_node_handle.param<std::string>("base_frame", m_base_frame, "base_link");
@@ -72,17 +73,18 @@ public:
 		m_node_handle.param("constrain_threshold_yaw", m_constrain_threshold_yaw, 0.2);
 		m_node_handle.param("transform_timeout", m_transform_timeout, 0.2);
 
-		m_sub_scan_topic = m_node_handle.subscribe("/scan", 10, &NeoLocalizationNode::scan_callback, this);
-		m_sub_map_topic = m_node_handle.subscribe("/map", 1, &NeoLocalizationNode::map_callback, this);
+		// m_sub_map_topic = m_node_handle.subscribe("/map", 1, &NeoLocalizationNode::map_callback, this);
 		m_sub_pose_estimate = m_node_handle.subscribe("/initialpose", 1, &NeoLocalizationNode::pose_callback, this);
 
 		m_pub_map_tile = m_node_handle.advertise<nav_msgs::OccupancyGrid>("/map_tile", 1);
 		m_pub_loc_pose = m_node_handle.advertise<geometry_msgs::PoseWithCovarianceStamped>("/amcl_pose", 10);
-		m_pub_loc_pose_2 = m_node_handle.advertise<geometry_msgs::PoseWithCovarianceStamped>("/map_pose", 10);
+		m_pub_loc_pose_2 = m_node_handle.advertise<geometry_msgs::PoseStamped>("/tracked_pose", 10);
 		m_pub_pose_array = m_node_handle.advertise<geometry_msgs::PoseArray>("/particlecloud", 10);
+		
+		m_server_localization_cmd = m_node_handle.advertiseService("/neo_localization_cmd", &NeoLocalizationNode::localization_cmd_service, this);
 
 		m_loc_update_timer = m_node_handle.createTimer(	ros::Rate(m_loc_update_rate),
-														&NeoLocalizationNode::loc_update, this);
+														&NeoLocalizationNode::loc_update, this, false, false);
 
 		m_map_update_thread = std::thread(&NeoLocalizationNode::update_loop, this);
 	}
@@ -94,13 +96,86 @@ public:
 		}
 	}
 
+	enum LOCALIZATION_STATE {
+		LOCALIZATION_STATE_OFF,
+		LOCALIZATION_STATE_LOCATING,
+		LOCALIZATION_STATE_DONE
+	};
+
+	bool localization_cmd_service(movexbot_msgs::SetSlamCmd::Request& req, movexbot_msgs::SetSlamCmd::Response& res)
+	{
+		ROS_INFO("Received localization command: %d", req.cmd);
+		if((req.cmd == req.SLAM_CMD_LOCATING && localization_state == LOCALIZATION_STATE_LOCATING)
+			|| (req.cmd == req.SLAM_CMD_STANDBY && localization_state == LOCALIZATION_STATE_OFF))
+		{
+			ROS_ERROR("Localization command repeated in state %d", localization_state);
+			res.state = res.STATE_ERROR;
+			return true;
+		}
+		switch (req.cmd)
+		{
+			case req.SLAM_CMD_STANDBY:
+				{
+					localization_state = LOCALIZATION_STATE_OFF;
+					m_sub_map_topic.shutdown();
+					m_sub_odom_topic.shutdown();
+					m_loc_update_timer.stop();
+				}
+				break;
+			case req.SLAM_CMD_LOCATING:
+				{
+					localization_state = LOCALIZATION_STATE_LOCATING;
+					m_sub_odom_topic = m_node_handle.subscribe("/odom", 10, &NeoLocalizationNode::odom_callback, this);
+					m_sub_scan_topic = m_node_handle.subscribe("/scan", 10, &NeoLocalizationNode::scan_callback, this);
+					nav_msgs::OccupancyGrid::ConstPtr map_msg = ros::topic::waitForMessage<nav_msgs::OccupancyGrid>("/map");
+					map_callback(map_msg);
+					if((std::isfinite(req.robot_pose.x) && std::isfinite(req.robot_pose.y) && std::isfinite(req.robot_pose.theta))
+						&& (req.robot_pose.x != 0 || req.robot_pose.y != 0 || req.robot_pose.theta != 0))
+					{
+						geometry_msgs::PoseWithCovarianceStamped pose_initial;
+						pose_initial.header.frame_id = m_map_frame;
+						pose_initial.pose.pose.position.x = req.robot_pose.x;
+						pose_initial.pose.pose.position.y = req.robot_pose.y;
+						pose_initial.pose.pose.orientation = tf::createQuaternionMsgFromYaw(req.robot_pose.theta);
+						pose_callback(pose_initial);
+					}
+					else
+						update_map();
+					m_loc_update_timer.start();
+				}
+				break;
+			default:
+				break;
+		}
+		res.state = res.STATE_SUCCESS;
+		return true;
+	}
+
 protected:
+
+	void odom_callback(const nav_msgs::Odometry::ConstPtr& odom)
+	{
+		geometry_msgs::TransformStamped pose;
+		pose.child_frame_id = odom->child_frame_id;
+		pose.header = odom->header;
+		pose.transform.translation.x = odom->pose.pose.position.x;
+		pose.transform.translation.y = odom->pose.pose.position.y;
+		pose.transform.translation.z = odom->pose.pose.position.z;
+		pose.transform.rotation = odom->pose.pose.orientation;
+
+		// publish the transform
+		m_tf_broadcaster.sendTransform(pose);
+	}
+
 	/*
 	 * Computes localization update for a single laser scan.
 	 */
 	void scan_callback(const sensor_msgs::LaserScan::ConstPtr& scan)
 	{
 		std::lock_guard<std::mutex> lock(m_node_mutex);
+
+		if(localization_state == LOCALIZATION_STATE_OFF)
+			return;
 
 		if(!m_map) {
 			return;
@@ -140,7 +215,7 @@ protected:
 
 		for(size_t i = 0; i < scan->ranges.size(); ++i)
 		{
-			if(scan->ranges[i] <= scan->range_min || scan->ranges[i] >= scan->range_max) {
+			if(scan->ranges[i] <= scan->range_min || scan->ranges[i] >= scan->range_max || std::isnan(scan->ranges[i])) {
 				continue;	// no actual measurement
 			}
 
@@ -158,6 +233,7 @@ protected:
 	void loc_update(const ros::TimerEvent& event)
 	{
 		std::lock_guard<std::mutex> lock(m_node_mutex);
+		// ROS_INFO("NeoLocalizationNode: loc_update");
 
 		if(!m_map || m_scan_buffer.empty()) {
 			return;
@@ -361,10 +437,14 @@ protected:
 			}
 		}
 		m_pub_loc_pose.publish(loc_pose);
-		m_pub_loc_pose_2.publish(loc_pose);
+		geometry_msgs::PoseStamped map_pose;
+		map_pose.header = loc_pose->header;
+		map_pose.pose = loc_pose->pose.pose;
+		m_pub_loc_pose_2.publish(map_pose);
 
 		// publish visualization
-		m_pub_pose_array.publish(pose_array);
+		if(m_pub_pose_array.getNumSubscribers() > 0)
+			m_pub_pose_array.publish(pose_array);
 
 		// keep last odom pose
 		m_last_odom_pose = odom_pose;
@@ -382,18 +462,20 @@ protected:
 	/*
 	 * Resets localization to given position.
 	 */
-	void pose_callback(const geometry_msgs::PoseWithCovarianceStamped::ConstPtr& pose)
+	void pose_callback(const geometry_msgs::PoseWithCovarianceStamped& pose)
 	{
+		ROS_INFO_STREAM("Initial pose: " << pose);
+		if(localization_state != LOCALIZATION_STATE_OFF)
 		{
 			std::lock_guard<std::mutex> lock(m_node_mutex);
 
-			if(pose->header.frame_id != m_map_frame) {
-				ROS_WARN_STREAM("NeoLocalizationNode: Invalid pose estimate frame: " << pose->header.frame_id);
+			if(pose.header.frame_id != m_map_frame) {
+				ROS_WARN_STREAM("NeoLocalizationNode: Invalid pose estimate frame: " << pose.header.frame_id);
 				return;
 			}
 
 			tf::Transform map_pose;
-			tf::poseMsgToTF(pose->pose.pose, map_pose);
+			tf::poseMsgToTF(pose.pose.pose, map_pose);
 
 			ROS_INFO_STREAM("NeoLocalizationNode: Got new map pose estimate: x=" << map_pose.getOrigin()[0]
 							<< " m, y=" <<  map_pose.getOrigin()[1] << " m, yaw=" << tf::getYaw(map_pose.getRotation()) << " rad");
@@ -536,7 +618,8 @@ protected:
 				ros_grid->data[y * map->size_x() + x] = (*map)(x, y) * 100.f;
 			}
 		}
-		m_pub_map_tile.publish(ros_grid);
+		if(m_pub_map_tile.getNumSubscribers() > 0)
+			m_pub_map_tile.publish(ros_grid);
 
 		ROS_DEBUG_STREAM("NeoLocalizationNode: Got new grid at offset (" << tile_x << ", " << tile_y << ") [iworld], "
 				"center = (" << tile_center[0] << ", " << tile_center[1] << ") [map]");
@@ -549,12 +632,18 @@ protected:
 	{
 		ros::Rate rate(m_map_update_rate);
 		while(ros::ok()) {
-			try {
-				update_map();	// get a new map tile periodically
+			if(localization_state != LOCALIZATION_STATE_OFF) 
+			{
+				// ROS_INFO_STREAM("NeoLocalizationNode: update_loop() is running, state: " << localization_state);
+				try {
+					update_map();	// get a new map tile periodically
+				}
+				catch(const std::exception& ex) {
+					ROS_WARN_STREAM("NeoLocalizationNode: update_map() failed: " << ex.what());
+				}
 			}
-			catch(const std::exception& ex) {
-				ROS_WARN_STREAM("NeoLocalizationNode: update_map() failed: " << ex.what());
-			}
+			// else
+			// 	ROS_INFO_STREAM("NeoLocalizationNode: update_loop() is stopped, state: " << localization_state);
 			rate.sleep();
 		}
 	}
@@ -568,6 +657,8 @@ protected:
 		{
 			// compose and publish transform for tf package
 			geometry_msgs::TransformStamped pose;
+
+#if 1
 			// compose header
 			pose.header.stamp = m_offset_time;
 			pose.header.frame_id = m_map_frame;
@@ -577,6 +668,20 @@ protected:
 			pose.transform.translation.y = m_offset_y;
 			pose.transform.translation.z = 0;
 			tf::quaternionTFToMsg(tf::createQuaternionFromYaw(m_offset_yaw), pose.transform.rotation);
+#else
+			// compose header
+			pose.header.stamp = m_offset_time;
+			pose.header.frame_id = m_map_frame;
+			pose.child_frame_id = m_base_frame;
+			// compose data container
+			tf::Transform odom_to_map;
+			odom_to_map.setOrigin(tf::Vector3(m_offset_x, m_offset_y, 0));
+			odom_to_map.setRotation(tf::createQuaternionFromYaw(m_offset_yaw));
+
+			tf::Transform base_to_map = base_to_odom * odom_to_map;
+
+			tf::transformTFToMsg(base_to_map, pose.transform);
+#endif
 
 			// publish the transform
 			m_tf_broadcaster.sendTransform(pose);
@@ -586,6 +691,9 @@ protected:
 private:
 	std::mutex m_node_mutex;
 
+	LOCALIZATION_STATE localization_state;
+	// tf::StampedTransform base_to_odom;
+
 	ros::NodeHandle m_node_handle;
 
 	ros::Publisher m_pub_map_tile;
@@ -594,8 +702,11 @@ private:
 	ros::Publisher m_pub_pose_array;
 
 	ros::Subscriber m_sub_map_topic;
+	ros::Subscriber m_sub_odom_topic;
 	ros::Subscriber m_sub_scan_topic;
 	ros::Subscriber m_sub_pose_estimate;
+
+	ros::ServiceServer m_server_localization_cmd;
 
 	ros::Timer m_loc_update_timer;
 
@@ -655,11 +766,14 @@ int main(int argc, char** argv)
 {
 	// initialize ROS
 	ros::init(argc, argv, "neo_localization_node");
+	ros::AsyncSpinner spinner(3);
+	spinner.start();
 
 	try {
 		NeoLocalizationNode node;
 
-		ros::spin();
+		// ros::spin();
+		ros::waitForShutdown();
 	}
 	catch(const std::exception& ex) {
 		ROS_ERROR_STREAM("NeoLocalizationNode: " << ex.what());
